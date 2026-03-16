@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import 'firebase_options.dart';
 
@@ -30,6 +33,7 @@ const String _defaultLastSeenImageUrl =
 
 const String _defaultLastSeenEnvironment =
     'Near the garden path, next to the wooden fence.';
+const Duration _bleLostTimeout = Duration(seconds: 8);
 
 enum PetKind {
   dog('dog', 'Dog', '🐶'),
@@ -560,6 +564,22 @@ class UserProfile {
   final String lastSeenEnvironment;
 }
 
+class BleSelection {
+  const BleSelection({
+    required this.remoteId,
+    required this.deviceName,
+    required this.rssi,
+    required this.connectable,
+    required this.updatedAt,
+  });
+
+  final String remoteId;
+  final String deviceName;
+  final int rssi;
+  final bool connectable;
+  final DateTime updatedAt;
+}
+
 enum PetStatus {
   veryClose('Connected / Very Close', 'Pet is very close', Color(0xFF2D936C)),
   nearby('Nearby', 'Pet is nearby', Color(0xFF3F7CAC)),
@@ -689,11 +709,25 @@ class _TrackerShellState extends State<TrackerShell> {
   double _rssiThreshold = -75;
   bool _isEnsuringProfile = false;
   String? _profileSyncError;
+  BleSelection? _selectedBleDevice;
+  Timer? _bleRefreshTimer;
 
   @override
   void initState() {
     super.initState();
     _ensureUserProfileDocument();
+    _bleRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || _selectedBleDevice == null) {
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _bleRefreshTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -808,10 +842,12 @@ class _TrackerShellState extends State<TrackerShell> {
   }
 
   Widget _buildTrackerScaffold(UserProfile profile, {String? profileSyncError}) {
-    final snapshot = _mockStates[_selectedMockIndex].copyWith(
-      petName: profile.petName,
-      scanEnabled: _mockStates[_selectedMockIndex].isConnected,
-    );
+    final snapshot = _selectedBleDevice != null
+        ? _liveSnapshotFromBle(profile, _selectedBleDevice!)
+        : _mockStates[_selectedMockIndex].copyWith(
+            petName: profile.petName,
+            scanEnabled: _mockStates[_selectedMockIndex].isConnected,
+          );
 
     final pages = [
       HomePage(
@@ -821,6 +857,7 @@ class _TrackerShellState extends State<TrackerShell> {
         profileSyncError: profileSyncError,
         selectedMockIndex: _selectedMockIndex,
         onScenarioSelected: _selectScenario,
+        isUsingLiveBle: _selectedBleDevice != null,
       ),
       HistoryPage(
         snapshot: snapshot,
@@ -833,6 +870,15 @@ class _TrackerShellState extends State<TrackerShell> {
         onThresholdChanged: (value) {
           setState(() {
             _rssiThreshold = value;
+          });
+        },
+      ),
+      BleDebugPage(
+        farThreshold: _rssiThreshold.round(),
+        selectedDevice: _selectedBleDevice,
+        onSelectedDeviceChanged: (selection) {
+          setState(() {
+            _selectedBleDevice = selection;
           });
         },
       ),
@@ -850,7 +896,12 @@ class _TrackerShellState extends State<TrackerShell> {
             ),
         ],
       ),
-      body: SafeArea(child: pages[_currentTab]),
+      body: SafeArea(
+        child: IndexedStack(
+          index: _currentTab,
+          children: pages,
+        ),
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentTab,
         onDestinationSelected: (index) {
@@ -874,9 +925,50 @@ class _TrackerShellState extends State<TrackerShell> {
             selectedIcon: Icon(Icons.tune),
             label: 'Device',
           ),
+          NavigationDestination(
+            icon: Icon(Icons.bluetooth_searching_outlined),
+            selectedIcon: Icon(Icons.bluetooth_searching),
+            label: 'BLE',
+          ),
         ],
       ),
     );
+  }
+
+  PetSnapshot _liveSnapshotFromBle(UserProfile profile, BleSelection selection) {
+    final age = DateTime.now().difference(selection.updatedAt);
+    final status = age > _bleLostTimeout
+        ? PetStatus.lost
+        : _statusFromRssi(selection.rssi);
+    return PetSnapshot(
+      petName: profile.petName,
+      status: status,
+      rssi: selection.rssi,
+      lastSeenTime: _formatTime(selection.updatedAt),
+      isConnected: age <= _bleLostTimeout,
+      locationLabel: age > _bleLostTimeout ? 'Last BLE sighting' : 'Live BLE scan',
+      beaconName: selection.deviceName,
+      uuid: selection.remoteId,
+      scanEnabled: age <= _bleLostTimeout,
+      detectionCount: 1,
+    );
+  }
+
+  PetStatus _statusFromRssi(int rssi) {
+    if (rssi >= -60) {
+      return PetStatus.veryClose;
+    }
+    if (rssi >= _rssiThreshold.round()) {
+      return PetStatus.nearby;
+    }
+    return PetStatus.far;
+  }
+
+  String _formatTime(DateTime dateTime) {
+    final hour = dateTime.hour.toString().padLeft(2, '0');
+    final minute = dateTime.minute.toString().padLeft(2, '0');
+    final second = dateTime.second.toString().padLeft(2, '0');
+    return '$hour:$minute:$second';
   }
 }
 
@@ -889,6 +981,7 @@ class HomePage extends StatelessWidget {
     required this.profileSyncError,
     required this.selectedMockIndex,
     required this.onScenarioSelected,
+    required this.isUsingLiveBle,
   });
 
   final PetSnapshot snapshot;
@@ -897,6 +990,7 @@ class HomePage extends StatelessWidget {
   final String? profileSyncError;
   final int selectedMockIndex;
   final ValueChanged<int> onScenarioSelected;
+  final bool isUsingLiveBle;
 
   @override
   Widget build(BuildContext context) {
@@ -1022,34 +1116,38 @@ class HomePage extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         Text(
-          'Prototype states',
+          isUsingLiveBle ? 'BLE Live Tracking' : 'Prototype states',
           style: theme.textTheme.titleLarge?.copyWith(
             fontWeight: FontWeight.w700,
           ),
         ),
         const SizedBox(height: 12),
-        Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: List.generate(_mockStates.length, (index) {
-            final state = _mockStates[index].status;
-            final selected = index == selectedMockIndex;
-            return ChoiceChip(
-              label: Text(state.label),
-              selected: selected,
-              onSelected: (_) => onScenarioSelected(index),
-              selectedColor: state.color.withValues(alpha: 0.18),
-              side: BorderSide(
-                color: selected ? state.color : Colors.black12,
-              ),
-            );
-          }),
-        ),
-        const SizedBox(height: 16),
         Text(
-          'Use these chips to simulate RSSI-driven state changes before BLE is connected.',
+          isUsingLiveBle
+              ? 'Home is currently driven by the BLE device you selected on the BLE tab. Clear it there to return to mock states.'
+              : 'Use these chips to simulate RSSI-driven state changes before BLE is connected.',
           style: theme.textTheme.bodyMedium?.copyWith(color: Colors.black54),
         ),
+        if (!isUsingLiveBle) ...[
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: List.generate(_mockStates.length, (index) {
+              final state = _mockStates[index].status;
+              final selected = index == selectedMockIndex;
+              return ChoiceChip(
+                label: Text(state.label),
+                selected: selected,
+                onSelected: (_) => onScenarioSelected(index),
+                selectedColor: state.color.withValues(alpha: 0.18),
+                side: BorderSide(
+                  color: selected ? state.color : Colors.black12,
+                ),
+              );
+            }),
+          ),
+        ],
       ],
     );
   }
@@ -1288,6 +1386,508 @@ class DevicePage extends StatelessWidget {
   }
 }
 
+class BleDebugPage extends StatefulWidget {
+  const BleDebugPage({
+    super.key,
+    required this.farThreshold,
+    required this.selectedDevice,
+    required this.onSelectedDeviceChanged,
+  });
+
+  final int farThreshold;
+  final BleSelection? selectedDevice;
+  final ValueChanged<BleSelection?> onSelectedDeviceChanged;
+
+  @override
+  State<BleDebugPage> createState() => _BleDebugPageState();
+}
+
+class _BleDebugPageState extends State<BleDebugPage> {
+  late final StreamSubscription<BluetoothAdapterState>
+      _adapterStateSubscription;
+  late final StreamSubscription<bool> _isScanningSubscription;
+  late final StreamSubscription<List<ScanResult>> _scanResultsSubscription;
+
+  BluetoothAdapterState _adapterState = BluetoothAdapterState.unknown;
+  bool _isSupported = true;
+  bool _isScanning = false;
+  bool _autoRescanEnabled = false;
+  String? _scanError;
+  String? _selectedRemoteId;
+  List<ScanResult> _scanResults = const [];
+  Timer? _rescanTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedRemoteId = widget.selectedDevice?.remoteId;
+    _initializeBle();
+  }
+
+  @override
+  void didUpdateWidget(covariant BleDebugPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.selectedDevice?.remoteId != oldWidget.selectedDevice?.remoteId) {
+      _selectedRemoteId = widget.selectedDevice?.remoteId;
+    }
+  }
+
+  Future<void> _initializeBle() async {
+    try {
+      _isSupported = await FlutterBluePlus.isSupported;
+
+      _adapterStateSubscription =
+          FlutterBluePlus.adapterState.listen((BluetoothAdapterState state) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _adapterState = state;
+        });
+      });
+
+      _isScanningSubscription = FlutterBluePlus.isScanning.listen((bool state) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _isScanning = state;
+        });
+        if (!state && _autoRescanEnabled && _selectedRemoteId != null) {
+          _scheduleRescan();
+        }
+      });
+
+      _scanResultsSubscription =
+          FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
+        results.sort((a, b) => b.rssi.compareTo(a.rssi));
+
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          _scanResults = List<ScanResult>.from(results);
+          _scanError = null;
+          if (_selectedRemoteId != null &&
+              !_scanResults.any(
+                (result) => result.device.remoteId.str == _selectedRemoteId,
+              )) {
+            // Keep tracking the last chosen device; it may simply be
+            // temporarily out of range and should age into Lost.
+          }
+        });
+
+        final selectedResult = _selectedResult;
+        if (selectedResult != null) {
+          widget.onSelectedDeviceChanged(_selectionFromResult(selectedResult));
+        }
+      }, onError: (Object error) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _scanError = 'Scan error: $error';
+        });
+      });
+
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (error) {
+      _adapterStateSubscription = const Stream<BluetoothAdapterState>.empty()
+          .listen((_) {});
+      _isScanningSubscription = const Stream<bool>.empty().listen((_) {});
+      _scanResultsSubscription = const Stream<List<ScanResult>>.empty().listen(
+        (_) {},
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isSupported = false;
+        _scanError = 'Bluetooth is unavailable on this platform: $error';
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _rescanTimer?.cancel();
+    _adapterStateSubscription.cancel();
+    _isScanningSubscription.cancel();
+    _scanResultsSubscription.cancel();
+    super.dispose();
+  }
+
+  Future<void> _startScan() async {
+    try {
+      _rescanTimer?.cancel();
+      setState(() {
+        _scanError = null;
+        _autoRescanEnabled = true;
+      });
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 12),
+        continuousUpdates: true,
+        removeIfGone: const Duration(seconds: 4),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _scanError = 'Could not start scan: $error';
+      });
+    }
+  }
+
+  Future<void> _stopScan() async {
+    try {
+      _rescanTimer?.cancel();
+      _autoRescanEnabled = false;
+      await FlutterBluePlus.stopScan();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _scanError = 'Could not stop scan: $error';
+      });
+    }
+  }
+
+  void _scheduleRescan() {
+    _rescanTimer?.cancel();
+    _rescanTimer = Timer(const Duration(milliseconds: 600), () {
+      if (!mounted || _isScanning || !_autoRescanEnabled) {
+        return;
+      }
+      _startScan();
+    });
+  }
+
+  ScanResult? get _selectedResult {
+    if (_selectedRemoteId == null) {
+      return null;
+    }
+    for (final result in _scanResults) {
+      if (result.device.remoteId.str == _selectedRemoteId) {
+        return result;
+      }
+    }
+    return null;
+  }
+
+  List<ScanResult> get _visibleScanResults {
+    final filtered = _scanResults.where((ScanResult result) {
+      final isSelected = result.device.remoteId.str == _selectedRemoteId;
+      final hasName = _deviceNameFor(result) != 'Unnamed BLE device';
+      final isConnectable = result.advertisementData.connectable;
+      return isSelected || hasName || isConnectable;
+    }).toList();
+
+    filtered.sort((a, b) {
+      final aSelected = a.device.remoteId.str == _selectedRemoteId;
+      final bSelected = b.device.remoteId.str == _selectedRemoteId;
+      if (aSelected != bSelected) {
+        return aSelected ? -1 : 1;
+      }
+
+      final aHasName = _deviceNameFor(a) != 'Unnamed BLE device';
+      final bHasName = _deviceNameFor(b) != 'Unnamed BLE device';
+      if (aHasName != bHasName) {
+        return aHasName ? -1 : 1;
+      }
+
+      return b.rssi.compareTo(a.rssi);
+    });
+
+    return filtered;
+  }
+
+  PetStatus _statusFromRssi(int rssi) {
+    if (rssi >= -60) {
+      return PetStatus.veryClose;
+    }
+    if (rssi >= widget.farThreshold) {
+      return PetStatus.nearby;
+    }
+    return PetStatus.far;
+  }
+
+  BleSelection _selectionFromResult(ScanResult result) {
+    return BleSelection(
+      remoteId: result.device.remoteId.str,
+      deviceName: _deviceNameFor(result),
+      rssi: result.rssi,
+      connectable: result.advertisementData.connectable,
+      updatedAt: DateTime.now(),
+    );
+  }
+
+  String _deviceNameFor(ScanResult result) {
+    final platformName = result.device.platformName.trim();
+    if (platformName.isNotEmpty) {
+      return platformName;
+    }
+
+    final advName = result.advertisementData.advName.trim();
+    if (advName.isNotEmpty) {
+      return advName;
+    }
+
+    return 'Unnamed BLE device';
+  }
+
+  String _adapterLabel(BluetoothAdapterState state) {
+    return switch (state) {
+      BluetoothAdapterState.on => 'Bluetooth On',
+      BluetoothAdapterState.off => 'Bluetooth Off',
+      BluetoothAdapterState.unavailable => 'Bluetooth Unsupported',
+      BluetoothAdapterState.unauthorized => 'Permission Needed',
+      BluetoothAdapterState.turningOn => 'Turning On',
+      BluetoothAdapterState.turningOff => 'Turning Off',
+      _ => 'Checking Bluetooth',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final selectedResult = _selectedResult;
+    final selectedStatus = selectedResult == null
+        ? PetStatus.lost
+        : _statusFromRssi(selectedResult.rssi);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+      children: [
+        Text(
+          'BLE Debug',
+          style: theme.textTheme.displaySmall?.copyWith(
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Use this page to verify that the phone can scan BLE devices, read RSSI, and map signal strength to pet states.',
+          style: theme.textTheme.bodyLarge?.copyWith(
+            color: Colors.black54,
+            height: 1.5,
+          ),
+        ),
+        const SizedBox(height: 20),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    _SignalBadge(status: selectedStatus),
+                    _InfoPill(label: _adapterLabel(_adapterState)),
+                    _InfoPill(label: _isScanning ? 'Scanning' : 'Idle'),
+                    _InfoPill(label: '${_visibleScanResults.length} shown'),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    FilledButton.icon(
+                      onPressed:
+                          _isSupported && !_isScanning ? _startScan : null,
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('Start Scan'),
+                    ),
+                    const SizedBox(width: 12),
+                    OutlinedButton.icon(
+                      onPressed: _isScanning ? _stopScan : null,
+                      icon: const Icon(Icons.stop),
+                      label: const Text('Stop'),
+                    ),
+                  ],
+                ),
+                if (_scanError != null) ...[
+                  const SizedBox(height: 14),
+                  Text(
+                    _scanError!,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: Colors.red.shade700,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Tracked Result',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (selectedResult == null)
+                  Text(
+                    'Select a scanned device below to preview how its RSSI maps to Very Close / Nearby / Far.',
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: Colors.black54,
+                      height: 1.5,
+                    ),
+                  )
+                else ...[
+                  _HistoryRow(
+                    label: 'Name',
+                    value: _deviceNameFor(selectedResult),
+                  ),
+                  const SizedBox(height: 12),
+                  _HistoryRow(
+                    label: 'Device ID',
+                    value: selectedResult.device.remoteId.str,
+                  ),
+                  const SizedBox(height: 12),
+                  _HistoryRow(
+                    label: 'RSSI',
+                    value: '${selectedResult.rssi} dBm',
+                  ),
+                  const SizedBox(height: 12),
+                  _HistoryRow(
+                    label: 'Mapped status',
+                    value: selectedStatus.label,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Nearby BLE Devices',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (_visibleScanResults.isEmpty)
+                  Text(
+                    'No named or connectable BLE devices yet. Start a scan and keep a BLE device nearby.',
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: Colors.black54,
+                      height: 1.5,
+                    ),
+                  )
+                else
+                  ..._visibleScanResults.map(_buildScanTile),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildScanTile(ScanResult result) {
+    final isSelected = result.device.remoteId.str == _selectedRemoteId;
+    final status = _statusFromRssi(result.rssi);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () {
+          final selection = _selectionFromResult(result);
+          setState(() {
+            _selectedRemoteId = selection.remoteId;
+            _autoRescanEnabled = true;
+          });
+          widget.onSelectedDeviceChanged(selection);
+          if (!_isScanning) {
+            _startScan();
+          }
+        },
+        child: Ink(
+          decoration: BoxDecoration(
+            color: isSelected
+                ? status.color.withValues(alpha: 0.12)
+                : const Color(0xFFF7F4EE),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: isSelected ? status.color : Colors.black12,
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _deviceNameFor(result),
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${result.rssi} dBm',
+                      style: TextStyle(
+                        color: status.color,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  result.device.remoteId.str,
+                  style: const TextStyle(
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _InfoPill(label: status.label),
+                    _InfoPill(
+                      label: result.advertisementData.connectable
+                          ? 'Connectable'
+                          : 'Non-connectable',
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _MetricTile extends StatelessWidget {
   const _MetricTile({
     required this.label,
@@ -1332,6 +1932,32 @@ class _MetricTile extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _InfoPill extends StatelessWidget {
+  const _InfoPill({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0xFFF0EBE0),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Text(
+          label,
+          style: const TextStyle(
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF4A4A4A),
+          ),
         ),
       ),
     );
