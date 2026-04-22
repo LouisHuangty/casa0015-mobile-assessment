@@ -38,7 +38,7 @@ const String _defaultLastSeenImageUrl =
 const String _defaultLastSeenEnvironment =
     'Near the garden path, next to the wooden fence.';
 const Duration _bleLostTimeout = Duration(seconds: 8);
-const String _raspberryPiBaseUrl = 'http://192.168.3.53';
+const String _defaultCameraBaseUrl = 'http://192.168.3.53';
 
 enum PetKind {
   dog('dog', 'Dog', '🐶'),
@@ -462,6 +462,7 @@ class _AuthPageState extends State<AuthPage> {
           petKind: _selectedPetKind,
           lastSeenImageUrl: _defaultLastSeenImageUrl,
           lastSeenEnvironment: _defaultLastSeenEnvironment,
+          captureEvents: const [],
         );
 
         final credential = await FirebaseAuth.instance
@@ -530,6 +531,10 @@ class _AuthPageState extends State<AuthPage> {
           pendingProfile?.lastSeenEnvironment ??
           (existingData['lastSeenEnvironment'] as String?) ??
           _defaultLastSeenEnvironment,
+      'captureEvents':
+          pendingProfile?.captureEvents.map((event) => event.toMap()).toList() ??
+          (existingData['captureEvents'] as List<dynamic>?) ??
+          const [],
       'updatedAt': FieldValue.serverTimestamp(),
       'createdAt': existingData['createdAt'] ?? FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
@@ -562,6 +567,7 @@ class UserProfile {
     required this.petKind,
     required this.lastSeenImageUrl,
     required this.lastSeenEnvironment,
+    required this.captureEvents,
   });
 
   final String displayName;
@@ -569,6 +575,7 @@ class UserProfile {
   final PetKind petKind;
   final String lastSeenImageUrl;
   final String lastSeenEnvironment;
+  final List<CaptureEvent> captureEvents;
 }
 
 class BleSelection {
@@ -716,11 +723,16 @@ class _TrackerShellState extends State<TrackerShell> {
   double _rssiThreshold = -75;
   bool _isEnsuringProfile = false;
   bool _isCaptureRequestInFlight = false;
+  bool _isCameraHealthCheckInFlight = false;
   bool _hasTriggeredCaptureForCurrentLoss = false;
+  bool? _isCameraOnline;
+  String _cameraBaseUrl = _defaultCameraBaseUrl;
   String? _profileSyncError;
   String? _captureError;
+  String? _cameraStatusMessage;
   String? _sessionLastSeenImageUrl;
   String? _sessionLastSeenEnvironment;
+  List<CaptureEvent> _captureEvents = const [];
   BleSelection? _selectedBleDevice;
   Timer? _bleRefreshTimer;
 
@@ -728,6 +740,7 @@ class _TrackerShellState extends State<TrackerShell> {
   void initState() {
     super.initState();
     _ensureUserProfileDocument();
+    unawaited(_checkCameraHealth());
     _bleRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || _selectedBleDevice == null) {
         return;
@@ -762,6 +775,7 @@ class _TrackerShellState extends State<TrackerShell> {
           petKind: PetKind.dog,
           lastSeenImageUrl: _defaultLastSeenImageUrl,
           lastSeenEnvironment: _defaultLastSeenEnvironment,
+          captureEvents: [],
         ),
       );
     }
@@ -796,6 +810,7 @@ class _TrackerShellState extends State<TrackerShell> {
               (data?['lastSeenEnvironment'] as String?) ??
               pendingProfile?.lastSeenEnvironment ??
               _defaultLastSeenEnvironment,
+          captureEvents: _captureEventsFromData(data?['captureEvents']),
         );
 
         if (data != null && _pendingUserProfile.value != null) {
@@ -879,8 +894,19 @@ class _TrackerShellState extends State<TrackerShell> {
         _sessionLastSeenImageUrl ?? profile.lastSeenImageUrl;
     final effectiveLastSeenEnvironment =
         _sessionLastSeenEnvironment ?? profile.lastSeenEnvironment;
+    final effectiveCaptureEvents = _mergedCaptureEvents(profile.captureEvents);
+    final latestSuccessfulCapture = effectiveCaptureEvents.where((event) {
+      return event.success;
+    }).fold<CaptureEvent?>(null, (latest, event) {
+      if (latest == null || event.timestamp.isAfter(latest.timestamp)) {
+        return event;
+      }
+      return latest;
+    });
 
-    _maybeTriggerLostCapture(profile, snapshot);
+    if (_selectedBleDevice != null) {
+      _maybeTriggerLostCapture(profile, snapshot);
+    }
 
     final pages = [
       HomePage(
@@ -888,25 +914,52 @@ class _TrackerShellState extends State<TrackerShell> {
         ownerName: profile.displayName,
         petKind: profile.petKind,
         profileSyncError: _mergeErrorMessages(profileSyncError, _captureError),
+        lastSeenImageUrl: effectiveLastSeenImageUrl,
+        latestCaptureEvent: latestSuccessfulCapture,
         selectedMockIndex: _selectedMockIndex,
-        onScenarioSelected: _selectScenario,
+        onScenarioSelected: (index) {
+          _selectScenario(index);
+
+          final selectedState = _mockStates[index];
+          if (_selectedBleDevice != null ||
+              selectedState.status != PetStatus.lost ||
+              _isCaptureRequestInFlight) {
+            return;
+          }
+
+          _hasTriggeredCaptureForCurrentLoss = true;
+          final simulatedSnapshot = selectedState.copyWith(
+            petName: profile.petName,
+            scanEnabled: selectedState.isConnected,
+          );
+          unawaited(_triggerRaspberryPiCapture(profile, simulatedSnapshot));
+        },
         isUsingLiveBle: _selectedBleDevice != null,
       ),
       HistoryPage(
         snapshot: snapshot,
         lastSeenImageUrl: effectiveLastSeenImageUrl,
         lastSeenEnvironment: effectiveLastSeenEnvironment,
+        captureEvents: effectiveCaptureEvents,
       ),
       DevicePage(
         snapshot: snapshot,
         rssiThreshold: _rssiThreshold,
-        raspberryPiBaseUrl: _raspberryPiBaseUrl,
+        raspberryPiBaseUrl: _cameraBaseUrl,
         isCaptureRequestInFlight: _isCaptureRequestInFlight,
+        isCameraHealthCheckInFlight: _isCameraHealthCheckInFlight,
+        isCameraOnline: _isCameraOnline,
+        cameraStatusMessage: _cameraStatusMessage,
+        captureError: _captureError,
+        lastCapturedImageUrl: _sessionLastSeenImageUrl,
         onTriggerCameraTest: () {
           if (_isCaptureRequestInFlight) {
             return;
           }
           unawaited(_triggerRaspberryPiCapture(profile, snapshot));
+        },
+        onCheckCameraHealth: () {
+          unawaited(_detectCameraService());
         },
         onThresholdChanged: (value) {
           setState(() {
@@ -984,11 +1037,6 @@ class _TrackerShellState extends State<TrackerShell> {
   }
 
   void _maybeTriggerLostCapture(UserProfile profile, PetSnapshot snapshot) {
-    if (_selectedBleDevice == null) {
-      _hasTriggeredCaptureForCurrentLoss = false;
-      return;
-    }
-
     if (snapshot.status != PetStatus.lost) {
       _hasTriggeredCaptureForCurrentLoss = false;
       return;
@@ -1009,12 +1057,13 @@ class _TrackerShellState extends State<TrackerShell> {
     setState(() {
       _isCaptureRequestInFlight = true;
       _captureError = null;
+      _cameraStatusMessage = 'Requesting a capture from the camera service...';
     });
 
     try {
       final response = await http
-          .get(Uri.parse('$_raspberryPiBaseUrl/capture-meta'))
-          .timeout(const Duration(seconds: 20));
+          .get(Uri.parse('$_cameraBaseUrl/capture-meta'))
+          .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
         throw Exception('Capture request failed: ${response.statusCode}');
@@ -1026,31 +1075,78 @@ class _TrackerShellState extends State<TrackerShell> {
           ? null
           : imagePath.startsWith('http')
           ? imagePath
-          : '$_raspberryPiBaseUrl$imagePath';
+          : '$_cameraBaseUrl$imagePath';
 
       if (imageUrl == null || imageUrl.isEmpty) {
         throw Exception('Capture response did not include an image URL.');
       }
 
+      final refreshedImageUrl = _withClientCacheBust(imageUrl);
       final environment =
           'BLE lost at ${snapshot.locationLabel} around ${snapshot.lastSeenTime}.';
 
       if (mounted) {
         setState(() {
-          _sessionLastSeenImageUrl = imageUrl;
+          _sessionLastSeenImageUrl = refreshedImageUrl;
           _sessionLastSeenEnvironment = environment;
           _captureError = null;
+          _isCameraOnline = true;
+          _cameraStatusMessage = 'Last capture succeeded just now.';
+          _captureEvents = [
+            CaptureEvent(
+              title: snapshot.status == PetStatus.lost
+                  ? 'BLE lost capture saved'
+                  : 'Manual camera test saved',
+              detail:
+                  '${snapshot.locationLabel} • ${snapshot.rssi} dBm • ${snapshot.lastSeenTime}',
+              timestamp: DateTime.now(),
+              success: true,
+            ),
+            ..._captureEvents,
+          ];
         });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              snapshot.status == PetStatus.lost
+                  ? 'BLE lost capture succeeded.'
+                  : 'Camera test capture succeeded.',
+            ),
+          ),
+        );
       }
 
-      await _saveLastSeenCapture(profile, imageUrl, environment);
+      await _saveLastSeenCapture(profile, refreshedImageUrl, environment);
     } catch (error) {
       if (!mounted) {
         return;
       }
+      final message = error is TimeoutException
+          ? 'Camera capture timed out. Check camera power and Wi-Fi.'
+          : 'Camera capture failed: $error';
       setState(() {
-        _captureError = 'Raspberry Pi capture failed: $error';
+        _captureError = message;
+        _isCameraOnline = false;
+        _cameraStatusMessage = message;
+        _captureEvents = [
+          CaptureEvent(
+            title: snapshot.status == PetStatus.lost
+                ? 'BLE lost capture failed'
+                : 'Manual camera test failed',
+            detail: message,
+            timestamp: DateTime.now(),
+            success: false,
+          ),
+          ..._captureEvents,
+        ];
       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: const Color(0xFFC62828),
+        ),
+      );
+      await _saveCaptureEvents(profile);
     } finally {
       if (mounted) {
         setState(() {
@@ -1080,8 +1176,195 @@ class _TrackerShellState extends State<TrackerShell> {
       'petKind': profile.petKind.storageValue,
       'lastSeenImageUrl': imageUrl,
       'lastSeenEnvironment': environment,
+      'captureEvents': _captureEvents.take(10).map((event) => event.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
+  }
+
+  Future<void> _saveCaptureEvents(UserProfile profile) async {
+    if (!_supportsFirebaseAuthOnThisPlatform || Firebase.apps.isEmpty) {
+      return;
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      return;
+    }
+
+    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+      'displayName': profile.displayName,
+      'petName': profile.petName,
+      'petKind': profile.petKind.storageValue,
+      'captureEvents': _captureEvents.take(10).map((event) => event.toMap()).toList(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  String _withClientCacheBust(String imageUrl) {
+    final uri = Uri.tryParse(imageUrl);
+    if (uri == null) {
+      return '$imageUrl${imageUrl.contains('?') ? '&' : '?'}client_ts=${DateTime.now().millisecondsSinceEpoch}';
+    }
+
+    return uri.replace(
+      queryParameters: {
+        ...uri.queryParameters,
+        'client_ts': DateTime.now().millisecondsSinceEpoch.toString(),
+      },
+    ).toString();
+  }
+
+  List<CaptureEvent> _captureEventsFromData(dynamic rawValue) {
+    if (rawValue is! List<dynamic>) {
+      return const [];
+    }
+
+    return rawValue
+        .whereType<Map<String, dynamic>>()
+        .map(CaptureEvent.fromMap)
+        .toList();
+  }
+
+  List<CaptureEvent> _mergedCaptureEvents(List<CaptureEvent> persistedEvents) {
+    final merged = <CaptureEvent>[];
+    final seenKeys = <String>{};
+
+    for (final event in [..._captureEvents, ...persistedEvents]) {
+      final key = '${event.timestamp.millisecondsSinceEpoch}-${event.title}';
+      if (seenKeys.add(key)) {
+        merged.add(event);
+      }
+    }
+
+    return merged;
+  }
+
+  Future<void> _checkCameraHealth() async {
+    if (_isCameraHealthCheckInFlight) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isCameraHealthCheckInFlight = true;
+      });
+    } else {
+      _isCameraHealthCheckInFlight = true;
+    }
+
+    try {
+      final data = await _probeCameraHealth(_cameraBaseUrl);
+      final ip = data['ip'] as String?;
+      final hostname = data['hostname'] as String?;
+      final statusMessage =
+          switch ((hostname, ip)) {
+            (String h, String ipAddr) => 'Online at $h ($ipAddr)',
+            (_, String ipAddr) => 'Online at $ipAddr',
+            _ => 'Camera service is reachable.',
+          };
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isCameraOnline = true;
+        _cameraStatusMessage = statusMessage;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isCameraOnline = false;
+        _cameraStatusMessage = 'Camera health check failed.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isCameraHealthCheckInFlight = false;
+        });
+      } else {
+        _isCameraHealthCheckInFlight = false;
+      }
+    }
+  }
+
+  Future<void> _detectCameraService() async {
+    if (_isCameraHealthCheckInFlight) {
+      return;
+    }
+
+    setState(() {
+      _isCameraHealthCheckInFlight = true;
+      _cameraStatusMessage = 'Detecting camera service...';
+    });
+
+    final currentUri = Uri.tryParse(_cameraBaseUrl);
+    final currentHost = currentUri?.host ?? '';
+    final candidates = <String>[
+      _cameraBaseUrl,
+      'http://timercam.local',
+      'http://192.168.4.1',
+      'http://192.168.3.53',
+    ];
+
+    if (currentHost.isNotEmpty) {
+      final parts = currentHost.split('.');
+      if (parts.length == 4) {
+        final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+        for (final suffix in [50, 51, 52, 53, 54, 55, 100]) {
+          candidates.add('http://$prefix.$suffix');
+        }
+      }
+    }
+
+    final seen = <String>{};
+    for (final candidate in candidates) {
+      if (!seen.add(candidate)) {
+        continue;
+      }
+      try {
+        final data = await _probeCameraHealth(candidate);
+        final ip = data['ip'] as String?;
+        final resolvedBaseUrl = ip != null && ip.isNotEmpty
+            ? 'http://$ip'
+            : candidate;
+
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _cameraBaseUrl = resolvedBaseUrl;
+          _isCameraOnline = true;
+          _cameraStatusMessage = 'Camera service detected at $resolvedBaseUrl';
+          _isCameraHealthCheckInFlight = false;
+        });
+        return;
+      } catch (_) {
+        continue;
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isCameraOnline = false;
+      _cameraStatusMessage = 'Could not detect a camera service on the local network.';
+      _isCameraHealthCheckInFlight = false;
+    });
+  }
+
+  Future<Map<String, dynamic>> _probeCameraHealth(String baseUrl) async {
+    final response = await http
+        .get(Uri.parse('$baseUrl/health'))
+        .timeout(const Duration(seconds: 3));
+
+    if (response.statusCode != 200) {
+      throw Exception('Health check failed: ${response.statusCode}');
+    }
+
+    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   PetSnapshot _liveSnapshotFromBle(
@@ -1133,6 +1416,8 @@ class HomePage extends StatelessWidget {
     required this.ownerName,
     required this.petKind,
     required this.profileSyncError,
+    required this.lastSeenImageUrl,
+    required this.latestCaptureEvent,
     required this.selectedMockIndex,
     required this.onScenarioSelected,
     required this.isUsingLiveBle,
@@ -1142,6 +1427,8 @@ class HomePage extends StatelessWidget {
   final String ownerName;
   final PetKind petKind;
   final String? profileSyncError;
+  final String lastSeenImageUrl;
+  final CaptureEvent? latestCaptureEvent;
   final int selectedMockIndex;
   final ValueChanged<int> onScenarioSelected;
   final bool isUsingLiveBle;
@@ -1251,6 +1538,81 @@ class HomePage extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 20),
+        if (latestCaptureEvent != null) ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                Text(
+                  'Last Automatic Capture',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Triggered automatically when the BLE signal is lost.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: Colors.black54,
+                    height: 1.4,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  latestCaptureEvent!.title,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    color: const Color(0xFF2E7D32),
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Captured automatically at ${latestCaptureEvent!.timestamp.hour.toString().padLeft(2, '0')}:${latestCaptureEvent!.timestamp.minute.toString().padLeft(2, '0')}:${latestCaptureEvent!.timestamp.second.toString().padLeft(2, '0')}',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  latestCaptureEvent!.detail,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: Colors.black87,
+                    height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(18),
+                    child: AspectRatio(
+                      aspectRatio: 4 / 3,
+                      child: Image.network(
+                        key: ValueKey(lastSeenImageUrl),
+                        lastSeenImageUrl,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) {
+                          return ColoredBox(
+                            color: const Color(0xFFF0ECE3),
+                            child: Center(
+                              child: Text(
+                                'Capture preview unavailable',
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: Colors.black54,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+        ],
         Row(
           children: [
             Expanded(
@@ -1307,17 +1669,57 @@ class HomePage extends StatelessWidget {
   }
 }
 
+class CaptureEvent {
+  const CaptureEvent({
+    required this.title,
+    required this.detail,
+    required this.timestamp,
+    required this.success,
+  });
+
+  factory CaptureEvent.fromMap(Map<String, dynamic> data) {
+    final rawTimestamp = data['timestamp'];
+    final timestamp =
+        rawTimestamp is String
+        ? DateTime.tryParse(rawTimestamp) ?? DateTime.now()
+        : DateTime.now();
+
+    return CaptureEvent(
+      title: data['title'] as String? ?? 'Capture event',
+      detail: data['detail'] as String? ?? '',
+      timestamp: timestamp,
+      success: data['success'] as bool? ?? false,
+    );
+  }
+
+  final String title;
+  final String detail;
+  final DateTime timestamp;
+  final bool success;
+
+  Map<String, dynamic> toMap() {
+    return {
+      'title': title,
+      'detail': detail,
+      'timestamp': timestamp.toIso8601String(),
+      'success': success,
+    };
+  }
+}
+
 class HistoryPage extends StatelessWidget {
   const HistoryPage({
     super.key,
     required this.snapshot,
     required this.lastSeenImageUrl,
     required this.lastSeenEnvironment,
+    required this.captureEvents,
   });
 
   final PetSnapshot snapshot;
   final String lastSeenImageUrl;
   final String lastSeenEnvironment;
+  final List<CaptureEvent> captureEvents;
 
   @override
   Widget build(BuildContext context) {
@@ -1330,6 +1732,41 @@ class HistoryPage extends StatelessWidget {
           'Last Seen',
           style: theme.textTheme.displaySmall?.copyWith(
             fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 20),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Recent Capture Events',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (captureEvents.isEmpty)
+                  Text(
+                    'No capture events yet. Trigger a camera test or let BLE loss fire one automatically.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: Colors.black54,
+                      height: 1.4,
+                    ),
+                  )
+                else
+                  Column(
+                    children: captureEvents.take(3).map((event) {
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: _CaptureEventTile(event: event),
+                      );
+                    }).toList(),
+                  ),
+              ],
+            ),
           ),
         ),
         const SizedBox(height: 20),
@@ -1386,6 +1823,7 @@ class HistoryPage extends StatelessWidget {
                   child: AspectRatio(
                     aspectRatio: 16 / 10,
                     child: Image.network(
+                      key: ValueKey(lastSeenImageUrl),
                       lastSeenImageUrl,
                       fit: BoxFit.cover,
                       errorBuilder: (context, error, stackTrace) {
@@ -1447,6 +1885,72 @@ class HistoryPage extends StatelessWidget {
   }
 }
 
+class _CaptureEventTile extends StatelessWidget {
+  const _CaptureEventTile({required this.event});
+
+  final CaptureEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = event.success
+        ? const Color(0xFF2E7D32)
+        : const Color(0xFFC62828);
+    final time =
+        '${event.timestamp.hour.toString().padLeft(2, '0')}:'
+        '${event.timestamp.minute.toString().padLeft(2, '0')}:'
+        '${event.timestamp.second.toString().padLeft(2, '0')}';
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: color.withValues(alpha: 0.2)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              event.success ? Icons.check_circle : Icons.error_outline,
+              color: color,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    event.title,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    time,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Colors.black54,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    event.detail,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Colors.black87,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class DevicePage extends StatelessWidget {
   const DevicePage({
     super.key,
@@ -1454,7 +1958,13 @@ class DevicePage extends StatelessWidget {
     required this.rssiThreshold,
     required this.raspberryPiBaseUrl,
     required this.isCaptureRequestInFlight,
+    required this.isCameraHealthCheckInFlight,
+    required this.isCameraOnline,
+    required this.cameraStatusMessage,
+    required this.captureError,
+    required this.lastCapturedImageUrl,
     required this.onTriggerCameraTest,
+    required this.onCheckCameraHealth,
     required this.onThresholdChanged,
   });
 
@@ -1462,12 +1972,28 @@ class DevicePage extends StatelessWidget {
   final double rssiThreshold;
   final String raspberryPiBaseUrl;
   final bool isCaptureRequestInFlight;
+  final bool isCameraHealthCheckInFlight;
+  final bool? isCameraOnline;
+  final String? cameraStatusMessage;
+  final String? captureError;
+  final String? lastCapturedImageUrl;
   final VoidCallback onTriggerCameraTest;
+  final VoidCallback onCheckCameraHealth;
   final ValueChanged<double> onThresholdChanged;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final cameraStatusColor = switch (isCameraOnline) {
+      true => const Color(0xFF2E7D32),
+      false => const Color(0xFFC62828),
+      null => const Color(0xFF6D6A64),
+    };
+    final cameraStatusLabel = switch (isCameraOnline) {
+      true => 'Online',
+      false => 'Offline',
+      null => 'Unknown',
+    };
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
@@ -1504,18 +2030,89 @@ class DevicePage extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Raspberry Pi Camera',
+                  'Camera Service',
                   style: theme.textTheme.titleLarge?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Base URL: $raspberryPiBaseUrl',
+                  'Current service endpoint',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.black54,
                   ),
                 ),
+                const SizedBox(height: 4),
+                Text(
+                  'Used for health checks, manual test capture, and BLE lost automatic capture.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: Colors.black54,
+                    height: 1.35,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: SelectableText(
+                        raspberryPiBaseUrl,
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Chip(
+                      label: const Text('In Use'),
+                      visualDensity: VisualDensity.compact,
+                      side: BorderSide(
+                        color: cameraStatusColor.withValues(alpha: 0.2),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Chip(
+                      avatar: Icon(
+                        isCameraOnline == true
+                            ? Icons.check_circle_outline
+                            : isCameraOnline == false
+                            ? Icons.error_outline
+                            : Icons.help_outline,
+                        size: 18,
+                        color: cameraStatusColor,
+                      ),
+                      label: Text(cameraStatusLabel),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: isCameraHealthCheckInFlight
+                          ? null
+                          : onCheckCameraHealth,
+                      icon: isCameraHealthCheckInFlight
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.wifi_tethering_outlined),
+                      label: const Text('Detect Camera Service'),
+                    ),
+                  ],
+                ),
+                if (cameraStatusMessage != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    cameraStatusMessage!,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: Colors.black87,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 16),
                 FilledButton.icon(
                   onPressed: isCaptureRequestInFlight
@@ -1536,12 +2133,31 @@ class DevicePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Use this to verify the Raspberry Pi camera service before relying on automatic BLE lost triggers.',
+                  'Use this to verify the camera service before relying on automatic BLE lost triggers.',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.black54,
                     height: 1.4,
                   ),
                 ),
+                if (captureError != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    captureError!,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFFC62828),
+                      height: 1.4,
+                    ),
+                  ),
+                ] else if (lastCapturedImageUrl != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    'Last capture is ready in History and Last Seen.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF2E7D32),
+                      height: 1.4,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
