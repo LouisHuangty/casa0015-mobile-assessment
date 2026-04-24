@@ -661,49 +661,49 @@ class PetSnapshot {
 
 const List<PetSnapshot> _mockStates = [
   PetSnapshot(
-    petName: 'Coco',
+    petName: 'Pet',
     status: PetStatus.veryClose,
     rssi: -49,
     lastSeenTime: '14:32:10',
     isConnected: true,
     locationLabel: 'Living room',
-    beaconName: 'Coco Tag',
+    beaconName: 'Pet Tag',
     uuid: 'FDA50693-A4E2-4FB1-AFCF-C6EB07647825',
     scanEnabled: true,
     detectionCount: 18,
   ),
   PetSnapshot(
-    petName: 'Coco',
+    petName: 'Pet',
     status: PetStatus.nearby,
     rssi: -67,
     lastSeenTime: '14:31:42',
     isConnected: true,
     locationLabel: 'Hallway',
-    beaconName: 'Coco Tag',
+    beaconName: 'Pet Tag',
     uuid: 'FDA50693-A4E2-4FB1-AFCF-C6EB07647825',
     scanEnabled: true,
     detectionCount: 12,
   ),
   PetSnapshot(
-    petName: 'Coco',
+    petName: 'Pet',
     status: PetStatus.far,
     rssi: -84,
     lastSeenTime: '14:30:05',
     isConnected: true,
     locationLabel: 'Garden gate',
-    beaconName: 'Coco Tag',
+    beaconName: 'Pet Tag',
     uuid: 'FDA50693-A4E2-4FB1-AFCF-C6EB07647825',
     scanEnabled: true,
     detectionCount: 5,
   ),
   PetSnapshot(
-    petName: 'Coco',
+    petName: 'Pet',
     status: PetStatus.lost,
     rssi: -99,
     lastSeenTime: '14:24:18',
     isConnected: false,
     locationLabel: 'UCL East',
-    beaconName: 'Coco Tag',
+    beaconName: 'Pet Tag',
     uuid: 'FDA50693-A4E2-4FB1-AFCF-C6EB07647825',
     scanEnabled: false,
     detectionCount: 0,
@@ -771,7 +771,7 @@ class _TrackerShellState extends State<TrackerShell> {
       return _buildTrackerScaffold(
         const UserProfile(
           displayName: '',
-          petName: 'Coco',
+          petName: 'Pet',
           petKind: PetKind.dog,
           lastSeenImageUrl: _defaultLastSeenImageUrl,
           lastSeenEnvironment: _defaultLastSeenEnvironment,
@@ -797,7 +797,7 @@ class _TrackerShellState extends State<TrackerShell> {
           petName:
               (data?['petName'] as String?) ??
               pendingProfile?.petName ??
-              'Coco',
+              'Pet',
           petKind: PetKind.fromStorageValue(
             (data?['petKind'] as String?) ??
                 pendingProfile?.petKind.storageValue,
@@ -884,10 +884,12 @@ class _TrackerShellState extends State<TrackerShell> {
     UserProfile profile, {
     String? profileSyncError,
   }) {
+    final displayPetName = _displayPetName(profile.petName);
     final snapshot = _selectedBleDevice != null
         ? _liveSnapshotFromBle(profile, _selectedBleDevice!)
         : _mockStates[_selectedMockIndex].copyWith(
-            petName: profile.petName,
+            petName: displayPetName,
+            beaconName: _beaconNameForPet(displayPetName),
             scanEnabled: _mockStates[_selectedMockIndex].isConnected,
           );
     final effectiveLastSeenImageUrl =
@@ -929,7 +931,8 @@ class _TrackerShellState extends State<TrackerShell> {
 
           _hasTriggeredCaptureForCurrentLoss = true;
           final simulatedSnapshot = selectedState.copyWith(
-            petName: profile.petName,
+            petName: displayPetName,
+            beaconName: _beaconNameForPet(displayPetName),
             scanEnabled: selectedState.isConnected,
           );
           unawaited(_triggerRaspberryPiCapture(profile, simulatedSnapshot));
@@ -1372,11 +1375,12 @@ class _TrackerShellState extends State<TrackerShell> {
     BleSelection selection,
   ) {
     final age = DateTime.now().difference(selection.updatedAt);
+    final displayPetName = _displayPetName(profile.petName);
     final status = age > _bleLostTimeout
         ? PetStatus.lost
         : _statusFromRssi(selection.rssi);
     return PetSnapshot(
-      petName: profile.petName,
+      petName: displayPetName,
       status: status,
       rssi: selection.rssi,
       lastSeenTime: _formatTime(selection.updatedAt),
@@ -1389,6 +1393,15 @@ class _TrackerShellState extends State<TrackerShell> {
       scanEnabled: age <= _bleLostTimeout,
       detectionCount: 1,
     );
+  }
+
+  String _displayPetName(String petName) {
+    final trimmedName = petName.trim();
+    return trimmedName.isEmpty ? 'Pet' : trimmedName;
+  }
+
+  String _beaconNameForPet(String petName) {
+    return '$petName Tag';
   }
 
   PetStatus _statusFromRssi(int rssi) {
@@ -2010,9 +2023,7 @@ class DevicePage extends StatelessWidget {
             padding: const EdgeInsets.all(20),
             child: Column(
               children: [
-                _HistoryRow(label: 'Beacon', value: snapshot.beaconName),
-                const SizedBox(height: 14),
-                _HistoryRow(label: 'UUID', value: snapshot.uuid),
+                _HistoryRow(label: 'Device name', value: snapshot.beaconName),
                 const SizedBox(height: 14),
                 _HistoryRow(
                   label: 'Scan status',
@@ -2232,6 +2243,7 @@ class _BleDebugPageState extends State<BleDebugPage> {
   String? _scanError;
   String? _selectedRemoteId;
   List<ScanResult> _scanResults = const [];
+  final List<String> _deviceOrder = <String>[];
   Timer? _rescanTimer;
 
   @override
@@ -2278,13 +2290,17 @@ class _BleDebugPageState extends State<BleDebugPage> {
 
       _scanResultsSubscription = FlutterBluePlus.scanResults.listen(
         (List<ScanResult> results) {
-          results.sort((a, b) => b.rssi.compareTo(a.rssi));
-
           if (!mounted) {
             return;
           }
 
           setState(() {
+            for (final result in results) {
+              final remoteId = result.device.remoteId.str;
+              if (!_deviceOrder.contains(remoteId)) {
+                _deviceOrder.add(remoteId);
+              }
+            }
             _scanResults = List<ScanResult>.from(results);
             _scanError = null;
             if (_selectedRemoteId != null &&
@@ -2422,7 +2438,13 @@ class _BleDebugPageState extends State<BleDebugPage> {
         return aHasName ? -1 : 1;
       }
 
-      return b.rssi.compareTo(a.rssi);
+      final aIndex = _deviceOrder.indexOf(a.device.remoteId.str);
+      final bIndex = _deviceOrder.indexOf(b.device.remoteId.str);
+      if (aIndex != bIndex) {
+        return aIndex.compareTo(bIndex);
+      }
+
+      return _deviceNameFor(a).compareTo(_deviceNameFor(b));
     });
 
     return filtered;
@@ -2635,6 +2657,7 @@ class _BleDebugPageState extends State<BleDebugPage> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: InkWell(
+        key: ValueKey(result.device.remoteId.str),
         borderRadius: BorderRadius.circular(20),
         onTap: () {
           final selection = _selectionFromResult(result);

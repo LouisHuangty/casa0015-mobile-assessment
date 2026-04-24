@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <NimBLEDevice.h>
 #include "esp_camera.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -9,9 +10,10 @@ namespace {
 
 constexpr char kWifiSsid[] = "不许偷网2.0";
 constexpr char kWifiPassword[] = "hjq311099";
-constexpr char kFallbackApSsid[] = "TimerCAM-Setup";
+constexpr char kDeviceName[] = "PetCam";
+constexpr char kFallbackApSsid[] = "PetCam-Setup";
 constexpr char kFallbackApPassword[] = "12345678";
-constexpr char kMdnsHostname[] = "timercam";
+constexpr char kMdnsHostname[] = "petcam";
 
 constexpr int kLedPin = 2;
 constexpr int kBatteryHoldPin = 33;
@@ -42,7 +44,7 @@ constexpr char kIndexHtml[] PROGMEM = R"HTML(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TimerCAM Live View</title>
+  <title>PetCam Live View</title>
   <style>
     :root {
       color-scheme: dark;
@@ -97,7 +99,7 @@ constexpr char kIndexHtml[] PROGMEM = R"HTML(
 </head>
 <body>
   <main>
-    <h1>M5Stack TimerCAM</h1>
+    <h1>M5Stack PetCam</h1>
     <p>Open a single JPEG snapshot or watch the MJPEG stream directly in the browser.</p>
     <img src="/stream" alt="Live camera stream">
     <div class="actions">
@@ -256,7 +258,7 @@ void handleStream() {
 void handleNotFound() {
   String message;
   message.reserve(128);
-  message += "TimerCAM is running.\n";
+  message += "PetCam is running.\n";
   message += "GET /\n";
   message += "GET /health\n";
   message += "GET /capture\n";
@@ -268,7 +270,7 @@ void handleNotFound() {
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
   Serial.println("Scanning nearby Wi-Fi networks...");
   const int networkCount = WiFi.scanNetworks(false, true);
   if (networkCount <= 0) {
@@ -331,6 +333,18 @@ void startServer() {
   Serial.println("HTTP server started");
 }
 
+void startBleAdvertising() {
+  NimBLEDevice::init(kDeviceName);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  NimBLEAdvertisementData advertisementData;
+  advertisementData.setName(kDeviceName);
+  advertising->setAdvertisementData(advertisementData);
+  advertising->start();
+  Serial.printf("BLE advertising as %s\n", kDeviceName);
+}
+
 }  // namespace
 
 void setup() {
@@ -356,6 +370,7 @@ void setup() {
     ESP.restart();
   }
 
+  startBleAdvertising();
   connectWifi();
   startServer();
 }
