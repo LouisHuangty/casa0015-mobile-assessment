@@ -37,7 +37,8 @@ const String _defaultLastSeenImageUrl =
 
 const String _defaultLastSeenEnvironment =
     'Near the garden path, next to the wooden fence.';
-const Duration _bleLostTimeout = Duration(seconds: 8);
+const Duration _bleSignalStaleTimeout = Duration(seconds: 8);
+const Duration _captureUiWatchdogTimeout = Duration(seconds: 6);
 const String _defaultCameraBaseUrl = 'http://192.168.3.53';
 
 enum PetKind {
@@ -597,8 +598,7 @@ class BleSelection {
 enum PetStatus {
   veryClose('Connected / Very Close', 'Pet is very close', Color(0xFF2D936C)),
   nearby('Nearby', 'Pet is nearby', Color(0xFF3F7CAC)),
-  far('Far', 'Pet is far away', Color(0xFFC97C1A)),
-  lost('Lost', 'Pet signal lost', Color(0xFFB6465F));
+  far('Far', 'Pet is far away', Color(0xFFC97C1A));
 
   const PetStatus(this.label, this.message, this.color);
 
@@ -698,15 +698,15 @@ const List<PetSnapshot> _mockStates = [
   ),
   PetSnapshot(
     petName: 'Pet',
-    status: PetStatus.lost,
-    rssi: -99,
+    status: PetStatus.far,
+    rssi: -92,
     lastSeenTime: '14:24:18',
-    isConnected: false,
-    locationLabel: 'UCL East',
+    isConnected: true,
+    locationLabel: 'Rear driveway',
     beaconName: 'Pet Tag',
     uuid: 'FDA50693-A4E2-4FB1-AFCF-C6EB07647825',
-    scanEnabled: false,
-    detectionCount: 0,
+    scanEnabled: true,
+    detectionCount: 2,
   ),
 ];
 
@@ -723,8 +723,14 @@ class _TrackerShellState extends State<TrackerShell> {
   double _rssiThreshold = -75;
   bool _isEnsuringProfile = false;
   bool _isCaptureRequestInFlight = false;
+  bool _isManualCaptureRequestInFlight = false;
   bool _isCameraHealthCheckInFlight = false;
-  bool _hasTriggeredCaptureForCurrentLoss = false;
+  bool _hasTriggeredFarCaptureInCurrentSession = false;
+  bool _wasInAutoFarState = false;
+  int _captureRequestId = 0;
+  int? _activeCaptureRequestId;
+  final List<int> _recentBleRssiValues = <int>[];
+  PetStatus _lastStableBleStatus = PetStatus.nearby;
   bool? _isCameraOnline;
   String _cameraBaseUrl = _defaultCameraBaseUrl;
   String? _profileSyncError;
@@ -735,6 +741,7 @@ class _TrackerShellState extends State<TrackerShell> {
   List<CaptureEvent> _captureEvents = const [];
   BleSelection? _selectedBleDevice;
   Timer? _bleRefreshTimer;
+  Timer? _captureWatchdogTimer;
 
   @override
   void initState() {
@@ -752,6 +759,7 @@ class _TrackerShellState extends State<TrackerShell> {
   @override
   void dispose() {
     _bleRefreshTimer?.cancel();
+    _captureWatchdogTimer?.cancel();
     super.dispose();
   }
 
@@ -907,7 +915,7 @@ class _TrackerShellState extends State<TrackerShell> {
     });
 
     if (_selectedBleDevice != null) {
-      _maybeTriggerLostCapture(profile, snapshot);
+      _maybeTriggerFarCapture(profile, snapshot);
     }
 
     final pages = [
@@ -923,13 +931,16 @@ class _TrackerShellState extends State<TrackerShell> {
           _selectScenario(index);
 
           final selectedState = _mockStates[index];
+          if (selectedState.status != PetStatus.far) {
+            _hasTriggeredFarCaptureInCurrentSession = false;
+          }
           if (_selectedBleDevice != null ||
-              selectedState.status != PetStatus.lost ||
-              _isCaptureRequestInFlight) {
+              selectedState.status != PetStatus.far ||
+              !_canTriggerFarCapture()) {
             return;
           }
 
-          _hasTriggeredCaptureForCurrentLoss = true;
+          _hasTriggeredFarCaptureInCurrentSession = true;
           final simulatedSnapshot = selectedState.copyWith(
             petName: displayPetName,
             beaconName: _beaconNameForPet(displayPetName),
@@ -949,17 +960,23 @@ class _TrackerShellState extends State<TrackerShell> {
         snapshot: snapshot,
         rssiThreshold: _rssiThreshold,
         raspberryPiBaseUrl: _cameraBaseUrl,
-        isCaptureRequestInFlight: _isCaptureRequestInFlight,
+        isCaptureRequestInFlight: _isManualCaptureRequestInFlight,
         isCameraHealthCheckInFlight: _isCameraHealthCheckInFlight,
         isCameraOnline: _isCameraOnline,
         cameraStatusMessage: _cameraStatusMessage,
         captureError: _captureError,
         lastCapturedImageUrl: _sessionLastSeenImageUrl,
         onTriggerCameraTest: () {
-          if (_isCaptureRequestInFlight) {
+          if (_isManualCaptureRequestInFlight) {
             return;
           }
-          unawaited(_triggerRaspberryPiCapture(profile, snapshot));
+          unawaited(
+            _triggerRaspberryPiCapture(
+              profile,
+              snapshot,
+              isManualTrigger: true,
+            ),
+          );
         },
         onCheckCameraHealth: () {
           unawaited(_detectCameraService());
@@ -975,7 +992,15 @@ class _TrackerShellState extends State<TrackerShell> {
         selectedDevice: _selectedBleDevice,
         onSelectedDeviceChanged: (selection) {
           setState(() {
+            final previousRemoteId = _selectedBleDevice?.remoteId;
             _selectedBleDevice = selection;
+            final nextRemoteId = selection?.remoteId;
+            if (previousRemoteId != nextRemoteId) {
+              _recentBleRssiValues.clear();
+              _hasTriggeredFarCaptureInCurrentSession = false;
+              _wasInAutoFarState = false;
+              _lastStableBleStatus = PetStatus.nearby;
+            }
           });
         },
       ),
@@ -1039,34 +1064,68 @@ class _TrackerShellState extends State<TrackerShell> {
     return '$profileError\n$captureError';
   }
 
-  void _maybeTriggerLostCapture(UserProfile profile, PetSnapshot snapshot) {
-    if (snapshot.status != PetStatus.lost) {
-      _hasTriggeredCaptureForCurrentLoss = false;
+  void _maybeTriggerFarCapture(UserProfile profile, PetSnapshot snapshot) {
+    if (snapshot.status != PetStatus.far) {
+      _hasTriggeredFarCaptureInCurrentSession = false;
+      _wasInAutoFarState = false;
       return;
     }
 
-    if (_hasTriggeredCaptureForCurrentLoss || _isCaptureRequestInFlight) {
+    if (_wasInAutoFarState || !_canTriggerFarCapture()) {
       return;
     }
 
-    _hasTriggeredCaptureForCurrentLoss = true;
+    _wasInAutoFarState = true;
+    _hasTriggeredFarCaptureInCurrentSession = true;
     unawaited(_triggerRaspberryPiCapture(profile, snapshot));
+  }
+
+  bool _canTriggerFarCapture() {
+    if (_isCaptureRequestInFlight || _hasTriggeredFarCaptureInCurrentSession) {
+      return false;
+    }
+    return true;
   }
 
   Future<void> _triggerRaspberryPiCapture(
     UserProfile profile,
     PetSnapshot snapshot,
+    {bool isManualTrigger = false}
   ) async {
+    String? deferredImageUrl;
+    String? deferredEnvironment;
+    bool shouldPersistCaptureEvents = false;
+    final requestId = ++_captureRequestId;
+
     setState(() {
+      _activeCaptureRequestId = requestId;
       _isCaptureRequestInFlight = true;
+      if (isManualTrigger) {
+        _isManualCaptureRequestInFlight = true;
+      }
       _captureError = null;
       _cameraStatusMessage = 'Requesting a capture from the camera service...';
+    });
+    _captureWatchdogTimer?.cancel();
+    _captureWatchdogTimer = Timer(_captureUiWatchdogTimeout, () {
+      if (!mounted || _activeCaptureRequestId != requestId) {
+        return;
+      }
+      setState(() {
+        _activeCaptureRequestId = null;
+        _isCaptureRequestInFlight = false;
+        if (isManualTrigger) {
+          _isManualCaptureRequestInFlight = false;
+        }
+        _captureError = 'Camera capture took too long. You can try again.';
+        _cameraStatusMessage = 'Capture timed out locally. Try again.';
+      });
     });
 
     try {
       final response = await http
           .get(Uri.parse('$_cameraBaseUrl/capture-meta'))
-          .timeout(const Duration(seconds: 8));
+          .timeout(const Duration(seconds: 4));
 
       if (response.statusCode != 200) {
         throw Exception('Capture request failed: ${response.statusCode}');
@@ -1086,7 +1145,11 @@ class _TrackerShellState extends State<TrackerShell> {
 
       final refreshedImageUrl = _withClientCacheBust(imageUrl);
       final environment =
-          'BLE lost at ${snapshot.locationLabel} around ${snapshot.lastSeenTime}.';
+          'BLE far event at ${snapshot.locationLabel} around ${snapshot.lastSeenTime}.';
+
+      if (_activeCaptureRequestId != requestId) {
+        return;
+      }
 
       if (mounted) {
         setState(() {
@@ -1097,8 +1160,8 @@ class _TrackerShellState extends State<TrackerShell> {
           _cameraStatusMessage = 'Last capture succeeded just now.';
           _captureEvents = [
             CaptureEvent(
-              title: snapshot.status == PetStatus.lost
-                  ? 'BLE lost capture saved'
+              title: snapshot.status == PetStatus.far
+                  ? 'BLE far capture saved'
                   : 'Manual camera test saved',
               detail:
                   '${snapshot.locationLabel} • ${snapshot.rssi} dBm • ${snapshot.lastSeenTime}',
@@ -1111,17 +1174,21 @@ class _TrackerShellState extends State<TrackerShell> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              snapshot.status == PetStatus.lost
-                  ? 'BLE lost capture succeeded.'
+              snapshot.status == PetStatus.far
+                  ? 'BLE far capture succeeded.'
                   : 'Camera test capture succeeded.',
             ),
           ),
         );
       }
 
-      await _saveLastSeenCapture(profile, refreshedImageUrl, environment);
+      deferredImageUrl = refreshedImageUrl;
+      deferredEnvironment = environment;
     } catch (error) {
       if (!mounted) {
+        return;
+      }
+      if (_activeCaptureRequestId != requestId) {
         return;
       }
       final message = error is TimeoutException
@@ -1133,8 +1200,8 @@ class _TrackerShellState extends State<TrackerShell> {
         _cameraStatusMessage = message;
         _captureEvents = [
           CaptureEvent(
-            title: snapshot.status == PetStatus.lost
-                ? 'BLE lost capture failed'
+            title: snapshot.status == PetStatus.far
+                ? 'BLE far capture failed'
                 : 'Manual camera test failed',
             detail: message,
             timestamp: DateTime.now(),
@@ -1149,13 +1216,24 @@ class _TrackerShellState extends State<TrackerShell> {
           backgroundColor: const Color(0xFFC62828),
         ),
       );
-      await _saveCaptureEvents(profile);
+      shouldPersistCaptureEvents = true;
     } finally {
-      if (mounted) {
+      if (mounted && _activeCaptureRequestId == requestId) {
+        _captureWatchdogTimer?.cancel();
         setState(() {
+          _activeCaptureRequestId = null;
           _isCaptureRequestInFlight = false;
+          if (isManualTrigger) {
+            _isManualCaptureRequestInFlight = false;
+          }
         });
       }
+    }
+
+    if (deferredImageUrl != null && deferredEnvironment != null) {
+      unawaited(_saveLastSeenCapture(profile, deferredImageUrl, deferredEnvironment));
+    } else if (shouldPersistCaptureEvents) {
+      unawaited(_saveCaptureEvents(profile));
     }
   }
 
@@ -1173,15 +1251,20 @@ class _TrackerShellState extends State<TrackerShell> {
       return;
     }
 
-    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
-      'displayName': profile.displayName,
-      'petName': profile.petName,
-      'petKind': profile.petKind.storageValue,
-      'lastSeenImageUrl': imageUrl,
-      'lastSeenEnvironment': environment,
-      'captureEvents': _captureEvents.take(10).map((event) => event.toMap()).toList(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .set({
+          'displayName': profile.displayName,
+          'petName': profile.petName,
+          'petKind': profile.petKind.storageValue,
+          'lastSeenImageUrl': imageUrl,
+          'lastSeenEnvironment': environment,
+          'captureEvents':
+              _captureEvents.take(10).map((event) => event.toMap()).toList(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true))
+        .timeout(const Duration(seconds: 5));
   }
 
   Future<void> _saveCaptureEvents(UserProfile profile) async {
@@ -1194,13 +1277,18 @@ class _TrackerShellState extends State<TrackerShell> {
       return;
     }
 
-    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
-      'displayName': profile.displayName,
-      'petName': profile.petName,
-      'petKind': profile.petKind.storageValue,
-      'captureEvents': _captureEvents.take(10).map((event) => event.toMap()).toList(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .set({
+          'displayName': profile.displayName,
+          'petName': profile.petName,
+          'petKind': profile.petKind.storageValue,
+          'captureEvents':
+              _captureEvents.take(10).map((event) => event.toMap()).toList(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true))
+        .timeout(const Duration(seconds: 5));
   }
 
   String _withClientCacheBust(String imageUrl) {
@@ -1376,21 +1464,21 @@ class _TrackerShellState extends State<TrackerShell> {
   ) {
     final age = DateTime.now().difference(selection.updatedAt);
     final displayPetName = _displayPetName(profile.petName);
-    final status = age > _bleLostTimeout
-        ? PetStatus.lost
-        : _statusFromRssi(selection.rssi);
+    final status = age > _bleSignalStaleTimeout
+        ? PetStatus.far
+        : _stableStatusFromRssi(selection.rssi);
     return PetSnapshot(
       petName: displayPetName,
       status: status,
       rssi: selection.rssi,
       lastSeenTime: _formatTime(selection.updatedAt),
-      isConnected: age <= _bleLostTimeout,
-      locationLabel: age > _bleLostTimeout
-          ? 'Last BLE sighting'
+      isConnected: age <= _bleSignalStaleTimeout,
+      locationLabel: age > _bleSignalStaleTimeout
+          ? 'Last BLE scan'
           : 'Live BLE scan',
       beaconName: selection.deviceName,
       uuid: selection.remoteId,
-      scanEnabled: age <= _bleLostTimeout,
+      scanEnabled: age <= _bleSignalStaleTimeout,
       detectionCount: 1,
     );
   }
@@ -1404,14 +1492,30 @@ class _TrackerShellState extends State<TrackerShell> {
     return '$petName Tag';
   }
 
-  PetStatus _statusFromRssi(int rssi) {
+  PetStatus _stableStatusFromRssi(int rssi) {
+    _recentBleRssiValues.add(rssi);
+    if (_recentBleRssiValues.length > 4) {
+      _recentBleRssiValues.removeAt(0);
+    }
+
     if (rssi >= -60) {
+      _lastStableBleStatus = PetStatus.veryClose;
       return PetStatus.veryClose;
     }
-    if (rssi >= _rssiThreshold.round()) {
+
+    final threshold = _rssiThreshold.round();
+    final farHits = _recentBleRssiValues.where((value) => value < threshold).length;
+    if (farHits >= 3) {
+      _lastStableBleStatus = PetStatus.far;
+      return PetStatus.far;
+    }
+
+    if (rssi >= threshold) {
+      _lastStableBleStatus = PetStatus.nearby;
       return PetStatus.nearby;
     }
-    return PetStatus.far;
+
+    return _lastStableBleStatus;
   }
 
   String _formatTime(DateTime dateTime) {
@@ -1449,6 +1553,13 @@ class HomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final visibleScenarioIndexes = <int>[];
+    final seenStatuses = <PetStatus>{};
+    for (var i = 0; i < _mockStates.length; i++) {
+      if (seenStatuses.add(_mockStates[i].status)) {
+        visibleScenarioIndexes.add(i);
+      }
+    }
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
@@ -1566,7 +1677,7 @@ class HomePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Triggered automatically when the BLE signal is lost.',
+                  'Triggered automatically when the BLE signal reaches Far.',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.black54,
                     height: 1.4,
@@ -1662,7 +1773,7 @@ class HomePage extends StatelessWidget {
           Wrap(
             spacing: 10,
             runSpacing: 10,
-            children: List.generate(_mockStates.length, (index) {
+            children: visibleScenarioIndexes.map((index) {
               final state = _mockStates[index].status;
               final selected = index == selectedMockIndex;
               return ChoiceChip(
@@ -1674,7 +1785,7 @@ class HomePage extends StatelessWidget {
                   color: selected ? state.color : Colors.black12,
                 ),
               );
-            }),
+            }).toList(),
           ),
         ],
       ],
@@ -2055,7 +2166,7 @@ class DevicePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Used for health checks, manual test capture, and BLE lost automatic capture.',
+                  'Used for health checks, manual test capture, and BLE Far automatic capture.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: Colors.black54,
                     height: 1.35,
@@ -2144,7 +2255,7 @@ class DevicePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Use this to verify the camera service before relying on automatic BLE lost triggers.',
+                  'Use this to verify the camera service before relying on automatic BLE Far triggers.',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.black54,
                     height: 1.4,
@@ -2308,7 +2419,7 @@ class _BleDebugPageState extends State<BleDebugPage> {
                   (result) => result.device.remoteId.str == _selectedRemoteId,
                 )) {
               // Keep tracking the last chosen device; it may simply be
-              // temporarily out of range and should age into Lost.
+              // temporarily out of range and should settle into Far.
             }
           });
 
@@ -2501,7 +2612,7 @@ class _BleDebugPageState extends State<BleDebugPage> {
     final theme = Theme.of(context);
     final selectedResult = _selectedResult;
     final selectedStatus = selectedResult == null
-        ? PetStatus.lost
+        ? PetStatus.far
         : _statusFromRssi(selectedResult.rssi);
 
     return ListView(
@@ -2540,7 +2651,9 @@ class _BleDebugPageState extends State<BleDebugPage> {
                   ],
                 ),
                 const SizedBox(height: 16),
-                Row(
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
                   children: [
                     FilledButton.icon(
                       onPressed: _isSupported && !_isScanning
@@ -2549,12 +2662,23 @@ class _BleDebugPageState extends State<BleDebugPage> {
                       icon: const Icon(Icons.play_arrow),
                       label: const Text('Start Scan'),
                     ),
-                    const SizedBox(width: 12),
                     OutlinedButton.icon(
                       onPressed: _isScanning ? _stopScan : null,
                       icon: const Icon(Icons.stop),
                       label: const Text('Stop'),
                     ),
+                    if (_selectedRemoteId != null)
+                      OutlinedButton.icon(
+                        onPressed: () {
+                          setState(() {
+                            _selectedRemoteId = null;
+                            _autoRescanEnabled = false;
+                          });
+                          widget.onSelectedDeviceChanged(null);
+                        },
+                        icon: const Icon(Icons.clear),
+                        label: const Text('Clear Device'),
+                      ),
                   ],
                 ),
                 if (_scanError != null) ...[
