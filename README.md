@@ -7,6 +7,7 @@ This repository was developed as part of CASA0015 Mobile Systems & Interactions 
 ## App Link
 
 - GitHub repository: <https://github.com/LouisHuangty/Pet-Beacon>
+- Video demo: <https://youtu.be/nXaRUo2nDik>
 
 
 ## Idea Generation and Research
